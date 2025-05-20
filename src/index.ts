@@ -1,4 +1,4 @@
-import { Channel, Command, Context, Dict, Schema, Service, Session, User } from "koishi"
+import { Channel, Command, Context, Element, Schema, Service, Session, SessionError, Time, User } from "koishi"
 
 declare module "koishi" {
   interface Context {
@@ -10,47 +10,84 @@ function getKey(session: Session) {
   return `${session.platform}:${session.selfId}:${session.channelId}:${session.messageId}`
 }
 
+const name = "auto-delete-response"
+
 class AutoDeleteResponse extends Service {
-  private _responses: Dict<Promise<string[] | undefined>>
+  private _deleted = new Map<string, () => void>()
+  private _requests = new Map<string, () => Promise<void>>()
 
   constructor(ctx: Context, public config: AutoDeleteResponse.Config) {
     super(ctx, "autoDeleteResponse", true)
-    this._responses = Object.create(null)
-
     ctx.on("message-deleted", async session => {
       const key = getKey(session)
-      if (!(key in this._responses)) return
-      const sent = await this._responses[key].catch(() => undefined)
-      delete this._responses[key]
-      if (!sent) return
-      for (const messageId of sent) {
-        try {
-          await session.bot.deleteMessage(session.channelId, messageId)
-        } catch (err) {
-          ctx.logger.error(err)
+      ctx.logger(name).debug("message %o deleted", key)
+      if (this._requests.has(key)) {
+        await this._requests.get(key)()
+      } else {
+        const stop = () => {
+          ctx.logger(name).debug("forget deleted message %o", key)
+          this._deleted.delete(key)
         }
+        const disposeTimeout = ctx.setTimeout(stop, this.config.timeout)
+        this._deleted.set(key, () => {
+          disposeTimeout()
+          this._deleted.delete(key)
+        })
       }
     })
   }
 
-  send(session: Session, ...sendArgs: Parameters<Session["send"]>) {
-    const sent = session.send(...sendArgs)
+  send(session: Session, ...sendArgs: Parameters<Session["send"]>): Promise<string[]> {
     const key = getKey(session)
-    this._responses[key] = sent
-    let stop = () => {
-      stop = null
-      delete this._responses[key]
-      disposeTimeout?.()
+
+    if (
+      (Array.isArray(sendArgs[0]) || typeof sendArgs[0] === "string") &&
+      !sendArgs[0].length
+    ) {
+      this.ctx.logger(name).debug("empty response for request message %o", key)
+      return Promise.resolve([])
     }
-    const disposeTimeout =
-      this.config.timeout > 0
-        ? this.ctx.setTimeout(stop, this.config.timeout)
-        : null
+
+    if (this._deleted.has(key)) {
+      this.ctx.logger(name).debug("cancel sending response because request message %o was recently deleted", key)
+      this._deleted.get(key)()
+      return Promise.resolve([])
+    }
+
+    const sent = session.send(...sendArgs)
+    const stop = () => {
+      this.ctx.logger(name).debug("forget request message %o", key)
+      this._requests.delete(key)
+      disposeTimeout()
+    }
+    const disposeTimeout = this.ctx.setTimeout(stop, this.config.timeout)
+
+    this._requests.set(key, async () => {
+      const mids = await sent.catch(() => undefined)
+      if (!mids) return
+      this.ctx.logger(name).debug("delete response messages %o for request message %o", mids, key)
+      this._requests.delete(key)
+      disposeTimeout()
+      for (const messageId of mids) {
+        try {
+          await session.bot.deleteMessage(session.channelId, messageId)
+        } catch (err) {
+          this.ctx.logger(name).warn(err)
+        }
+      }
+    })
+
     return sent.then(
       mids => {
-        if (!mids) stop?.()
+        if (!mids?.length) {
+          this.ctx.logger(name).debug("nothing sent for request message %o", key)
+          stop()
+        }
+        this.ctx.logger(name).debug("sent response messages %o for request message %o", mids, key)
+        return mids
       },
       r => {
+        this.ctx.logger(name).debug("failed to send response for request message %o", key, r)
         stop?.()
         return Promise.reject(r)
       }
@@ -64,9 +101,12 @@ class AutoDeleteResponse extends Service {
     O extends {} = {}
   >(action: Command.Action<U, G, A, O>): Command.Action<U, G, A, O> {
     return async (argv, ...args) => {
-      const result = await action(argv, ...args)
-      if (result && argv.root) return this.send(argv.session, result)
-      return result
+      if (!argv.root) return action(argv, ...args)
+      const result = await Promise.resolve(action(argv, ...args)).catch(err => {
+        if (err instanceof SessionError) return argv.session.i18n(err.path, err.param)
+        throw err
+      })
+      if (result) this.send(argv.session, result)
     }
   }
 }
@@ -78,8 +118,8 @@ namespace AutoDeleteResponse {
 
   export const Config: Schema<Config> = Schema.object({
     timeout: Schema.natural()
-      .default(300000)
-      .description("自动撤回的默认有效时间。小于或等于 0 则永不超时（不推荐）。"),
+      .default(5 * Time.minute)
+      .description("自动撤回的有效时间。"),
   })
 }
 

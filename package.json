@@ -1,7 +1,7 @@
 {
   "name": "@dgck81lnn/koishi-plugin-auto-delete-response",
   "description": "Auto deleted responses service for Koishi",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
